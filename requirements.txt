@@ -1,0 +1,5 @@
+# contrib build is required for the CSRT assisted tracker (cv2.TrackerCSRT)
+opencv-contrib-python>=4.8
+numpy>=1.24
+scipy>=1.10
+streamlit>=1.30

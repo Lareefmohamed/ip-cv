@@ -48,6 +48,9 @@ def main(argv=None) -> int:
     p.add_argument("--frames", type=int, default=120)
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--hard", action="store_true",
+                   help="harder clip: faster ball, motion blur, camera jitter "
+                        "and a brief occlusion (stress test for the tracker)")
     args = p.parse_args(argv)
 
     rng = np.random.default_rng(args.seed)
@@ -56,49 +59,76 @@ def main(argv=None) -> int:
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(args.out, fourcc, args.fps, (W, H))
 
-    # Projectile arc: ball thrown from the left, bounces once.
-    x0, y0 = 80.0, 180.0
-    vx, vy = 6.4, 1.5
-    g = 0.55
-    radius = 9
+    # Projectile arc.  The hard clip uses a much faster ball (big per-frame
+    # displacement -> motion blur) crossing the frame once, plus a brief
+    # occlusion window.  No bounce / edge-clamp so the ball never sits still.
+    if args.hard:
+        x0, y0 = 60.0, 170.0
+        vx, vy, g, radius = 10.0, 0.4, 0.06, 8     # gentle arc, stays in frame
+        occlusion = range(args.frames // 2, args.frames // 2 + 4)
+    else:
+        x0, y0 = 80.0, 180.0
+        vx, vy, g, radius = 6.4, 1.5, 0.55, 9
+        occlusion = range(0)
     x, y = x0, y0
+    prev = (x, y)
 
     gt_rows = []
     for f in range(args.frames):
         frame = base.copy()
 
-        # A moving NON-red distractor (white player) — wrong colour, must be
-        # ignored by the colour mask.
-        px = int(120 + (f * 3) % (W - 240))
-        cv2.circle(frame, (px, 360), 16, (230, 230, 230), -1)
+        # Optional whole-frame camera jitter (shifts everything a few px).
+        jx = jy = 0
+        if args.hard:
+            jx, jy = int(rng.integers(-3, 4)), int(rng.integers(-3, 4))
+
+        # A moving NON-red distractor (white player).
+        pxd = int(120 + (f * 3) % (W - 240))
+        cv2.circle(frame, (pxd + jx, 360 + jy), 16, (230, 230, 230), -1)
 
         # Physics update for the ball.
+        prev = (x, y)
         x += vx
         y += vy
-        vy += g
-        if y > H - 40 and vy > 0:        # bounce off the pitch
-            vy = -vy * 0.7
-        x = min(x, W - 5)
+        if not args.hard:
+            vy += g
+            if y > H - 40 and vy > 0:    # bounce off the pitch (easy clip only)
+                vy = -vy * 0.7
+            x = min(x, W - 5)
+        else:
+            vy += g
+        cx, cy = int(x) + jx, int(y) + jy
 
-        # Draw the red ball with a subtle seam + mild motion blur smear.
-        cx, cy = int(x), int(y)
-        cv2.circle(frame, (cx, cy), radius, (0, 0, 210), -1)
-        cv2.circle(frame, (cx, cy), radius, (0, 0, 150), 1)
-        cv2.line(frame, (cx - radius, cy), (cx + radius, cy), (20, 20, 90), 1)
+        # Off-screen counts as occluded (nothing to detect there).
+        off_screen = not (0 <= cx < W and 0 <= cy < H)
+        occluded = (f in occlusion) or off_screen
+        if not occluded:
+            if args.hard:
+                # Motion-blur smear: a thick line from the previous position
+                # to the current one, ending in the round ball.
+                px0, py0 = int(prev[0]) + jx, int(prev[1]) + jy
+                cv2.line(frame, (px0, py0), (cx, cy), (0, 0, 200),
+                         max(3, radius), cv2.LINE_AA)
+            cv2.circle(frame, (cx, cy), radius, (0, 0, 210), -1)
+            cv2.circle(frame, (cx, cy), radius, (0, 0, 150), 1)
+            cv2.line(frame, (cx - radius, cy), (cx + radius, cy),
+                     (20, 20, 90), 1)
 
         # Sensor noise.
         noise = rng.integers(-12, 12, frame.shape, dtype=np.int16)
         frame = np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
         writer.write(frame)
-        gt_rows.append((f, round(x, 1), round(y, 1), radius))
+        # Ground truth records the true centre and whether it was occluded.
+        gt_rows.append((f, round(x + jx, 1), round(y + jy, 1), radius,
+                        int(occluded)))
 
     writer.release()
 
     gt_path = os.path.splitext(args.out)[0] + ".gt.csv"
     with open(gt_path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["frame", "x", "y", "radius"])
+        w.writerow(["frame", "x", "y", "radius", "occluded"])
         w.writerows(gt_rows)
 
     print(f"Wrote {args.out} ({args.frames} frames) and {gt_path}")

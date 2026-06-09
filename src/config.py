@@ -63,6 +63,16 @@ class DetectorConfig:
     mog2_var_threshold: float = 32.0
     motion_dilate: int = 9         # dilate the motion mask so it covers a fast,
     #                                motion-blurred ball comfortably.
+    # Soft motion gate: instead of deleting colour blobs that miss the motion
+    # mask (hard AND), keep them all and merely *boost* the score of blobs that
+    # overlap motion.  Far higher recall on fast balls / shaky cameras.
+    soft_motion: bool = False
+    warmup_frames: int = 12        # skip the motion gate until MOG2 is warm
+
+    # Blur tolerance: accept elongated (motion-blurred) blobs when they are
+    # convex/solid enough, even if their circularity is low.
+    accept_blur: bool = False
+    min_solidity: float = 0.80     # contour area / convex-hull area
 
     # Contour / shape filtering.
     min_area: float = 12.0         # px^2 - reject tiny speckle
@@ -71,6 +81,13 @@ class DetectorConfig:
     min_radius: float = 2.0        # px - minimum enclosing-circle radius
     max_radius: float = 60.0       # px
     min_fill_ratio: float = 0.55   # contour area / enclosing-circle area
+
+    # ROI-guided detection: when a tracker prediction is supplied, blobs inside
+    # the search window are judged with these relaxed thresholds (higher recall
+    # exactly where the ball is expected to be).
+    roi_min_circularity: float = 0.30
+    roi_min_fill_ratio: float = 0.35
+    roi_min_area: float = 4.0
 
     def ranges(self) -> List[HSVRange]:
         """Resolve the active list of HSV ranges."""
@@ -151,7 +168,21 @@ def make_preset(name: str) -> PipelineConfig:
         cfg.detector.min_fill_ratio = 0.40
         cfg.tracker.max_match_dist = 200.0
         return cfg
+    if name == "hybrid":
+        # General-purpose robust profile for the hybrid engine: soft motion
+        # gate, blur tolerance and a wider gate so the detector + CSRT + Kalman
+        # fusion keeps the ball through blur and brief misses.
+        cfg.detector.soft_motion = True
+        cfg.detector.accept_blur = True
+        cfg.detector.min_circularity = 0.40
+        cfg.detector.min_fill_ratio = 0.45
+        cfg.detector.min_area = 6.0
+        cfg.detector.motion_dilate = 13
+        cfg.detector.warmup_frames = 6   # seed sooner; MOG2 is usable quickly
+        cfg.tracker.max_match_dist = 140.0
+        cfg.tracker.max_coast_frames = 12
+        return cfg
     raise ValueError(f"Unknown preset: {name!r}")
 
 
-PRESETS = ["default", "fast", "white-ball", "broadcast"]
+PRESETS = ["default", "fast", "white-ball", "broadcast", "hybrid"]

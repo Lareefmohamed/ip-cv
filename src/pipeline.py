@@ -236,3 +236,87 @@ def process_video_assisted(in_path: str,
         "track_log": track_log,
         "mode": "assisted-manual" if bbox is not None else "assisted-auto",
     }
+
+
+def process_video_hybrid(in_path: str,
+                         out_path: Optional[str] = None,
+                         config: Optional[PipelineConfig] = None,
+                         fill_gaps: bool = True,
+                         calibrate_bbox: Optional[Tuple[int, int, int, int]] = None,
+                         calibrate_frame: int = 0,
+                         progress: Optional[Callable[[int, int], None]] = None
+                         ) -> dict:
+    """Process a whole video with the hybrid (detector+CSRT+Kalman) engine.
+
+    Reports BOTH a real ``detection_rate`` (genuine detector/CSRT locks) and a
+    ``coverage`` (also counts gap-filled prediction frames), so the trade-off is
+    transparent.  ``calibrate_bbox`` (with ``calibrate_frame``) auto-tunes the
+    HSV range from a boxed ball before tracking starts.
+    """
+    from .hybrid_tracker import HybridTracker
+
+    meta = video_meta(in_path)
+    cfg = config or PipelineConfig()
+
+    # Optional one-click HSV calibration from a boxed ball.
+    if calibrate_bbox is not None:
+        from .calibrate import calibrate_hsv
+        seed = _read_frame(in_path, calibrate_frame)
+        if seed is not None:
+            cfg.detector.custom_ranges = calibrate_hsv(seed, calibrate_bbox)
+
+    tracker = HybridTracker(cfg, fill_gaps=fill_gaps)
+
+    writer = None
+    if out_path:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(out_path, fourcc, meta["fps"] or 30.0,
+                                 (meta["width"], meta["height"]))
+
+    measured = covered = total = 0
+    fps_sum = 0.0
+    track_log: List[Tuple[int, float, float, str]] = []
+    try:
+        for idx, frame in enumerate(iter_video(in_path)):
+            t0 = time.perf_counter()
+            ball = tracker.update(frame)
+            dt = time.perf_counter() - t0
+            fps = 1.0 / dt if dt > 0 else 0.0
+            fps_sum += fps
+            total += 1
+            if ball is not None:
+                covered += 1
+                if ball[2] == "measured" or ball[2] == "csrt":
+                    measured += 1
+                track_log.append((idx, ball[0], ball[1], ball[2]))
+            annotated = draw_overlay(frame, cfg, ball, tracker.last_radius,
+                                     tracker.trail, fps=fps, frame_idx=idx)
+            if writer is not None:
+                writer.write(annotated)
+            if progress is not None:
+                progress(total, meta["frames"])
+    finally:
+        if writer is not None:
+            writer.release()
+
+    return {
+        "frames": total,
+        "measured_detections": measured,
+        "detection_rate": (measured / total) if total else 0.0,
+        "coverage": (covered / total) if total else 0.0,
+        "mean_proc_fps": (fps_sum / total) if total else 0.0,
+        "video_fps": meta["fps"],
+        "out_path": out_path,
+        "track_log": track_log,
+        "outcomes": tracker.outcomes,
+        "reject_totals": tracker.reject_totals,
+        "mode": "hybrid",
+    }
+
+
+def _read_frame(path: str, index: int) -> Optional[np.ndarray]:
+    cap = cv2.VideoCapture(path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, index))
+    ok, frame = cap.read()
+    cap.release()
+    return frame if ok else None

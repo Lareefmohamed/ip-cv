@@ -21,9 +21,9 @@ import cv2
 import numpy as np
 import streamlit as st
 
-from src.config import PipelineConfig
+from src.config import PipelineConfig, make_preset
 from src.pipeline import (CricketBallPipeline, process_video_assisted,
-                          video_meta)
+                          process_video_hybrid, video_meta)
 
 st.set_page_config(page_title="Cricket Ball Trajectory Tracker",
                    page_icon="🏏", layout="wide")
@@ -38,17 +38,31 @@ with st.sidebar:
     st.header("Settings")
     mode = st.radio(
         "Tracking mode",
-        ["Automatic (HSV + motion)",
+        ["Hybrid (recommended)",
+         "Automatic (HSV + motion)",
          "Assisted (CSRT, auto-seed)",
          "Assisted (CSRT, click the ball)"],
         index=0,
-        help="Automatic = colour-based, best for a clear red ball on a steady "
-             "camera. Assisted = CSRT, robust on white balls / clutter / blur.")
+        help="Hybrid = detector + CSRT + Kalman with gap-filling; most robust "
+             "on general clips. Automatic = colour-only. Assisted = CSRT only.")
+    is_hybrid = mode.startswith("Hybrid")
     is_assisted = mode.startswith("Assisted")
     is_manual = mode.endswith("click the ball)")
 
+    fill_gaps = True
+    calibrate = False
+    if is_hybrid:
+        fill_gaps = st.checkbox(
+            "Fill short gaps smoothly", value=True,
+            help="Interpolate brief misses from the Kalman prediction so the "
+                 "trajectory stays continuous (counts toward coverage).")
+        calibrate = st.checkbox(
+            "Calibrate colour from a box", value=False,
+            help="Draw a box on the ball to auto-tune the HSV range for your "
+                 "exact ball / lighting.")
+
     color = st.selectbox("Ball colour", ["red", "white", "pink"], index=0,
-                         help="Used by Automatic mode and by Assisted auto-seed.")
+                         help="Used by Automatic, Hybrid and Assisted auto-seed.")
     use_motion = st.checkbox(
         "Motion gating (MOG2)", value=True,
         help="Suppresses static same-coloured clutter. Turn off for very "
@@ -66,7 +80,7 @@ with st.sidebar:
 
 
 def make_config() -> PipelineConfig:
-    cfg = PipelineConfig()
+    cfg = make_preset("hybrid") if is_hybrid else PipelineConfig()
     cfg.detector.color = color
     cfg.detector.use_motion = use_motion
     cfg.detector.min_circularity = min_circ
@@ -103,11 +117,14 @@ def read_frame(path: str, index: int):
     return frame if ok else None
 
 
-# --- Manual seed-box placement (only for the "click the ball" mode) ---------
+# --- Box placement: needed for manual CSRT, or for hybrid colour calibration --
 seed_frame = 0
 bbox = None
-if is_manual:
-    st.subheader("1) Place a box on the ball")
+need_box = is_manual or (is_hybrid and calibrate)
+if need_box:
+    label = ("Place a box on the ball to calibrate its colour"
+             if is_hybrid else "Place a box on the ball")
+    st.subheader(f"1) {label}")
     seed_frame = st.slider("Seed frame", 0, max(meta["frames"] - 1, 0),
                            min(meta["frames"] // 3, max(meta["frames"] - 1, 0)))
     frame = read_frame(tmp_in.name, seed_frame)
@@ -139,7 +156,27 @@ out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
 
 
 # --- Processing ------------------------------------------------------------
-if is_assisted:
+coverage = None
+if is_hybrid:
+    progress = st.progress(0.0, text="Tracking (hybrid)…")
+    n_frames = max(meta["frames"], 1)
+
+    def _cb(i, n):
+        progress.progress(min(i / n_frames, 1.0),
+                          text=f"Tracking… {i}/{meta['frames']}")
+
+    stats = process_video_hybrid(
+        tmp_in.name, out_path=out_path, config=cfg, fill_gaps=fill_gaps,
+        calibrate_bbox=(bbox if (calibrate and bbox) else None),
+        calibrate_frame=seed_frame, progress=_cb)
+    progress.empty()
+    measured = stats["measured_detections"]
+    total = stats["frames"]
+    rate = stats["detection_rate"]
+    coverage = stats["coverage"]
+    proc_fps = stats["mean_proc_fps"]
+    track_log = stats["track_log"]
+elif is_assisted:
     progress = st.progress(0.0, text="Tracking (CSRT)…")
     n_frames = max(meta["frames"], 1)
 
@@ -194,10 +231,17 @@ else:
 
 # --- Results ---------------------------------------------------------------
 st.success(f"Done! Mode: {mode}")
-m1, m2, m3 = st.columns(3)
-m1.metric("Tracked rate", f"{rate:.1%}")
-m2.metric("Frames tracked", f"{measured}/{total}")
-m3.metric("Processing speed", f"{proc_fps:.1f} FPS")
+if coverage is not None:
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Detection rate", f"{rate:.1%}", help="Genuine detector/CSRT locks")
+    m2.metric("Coverage", f"{coverage:.1%}", help="Incl. gap-filled frames")
+    m3.metric("Frames tracked", f"{measured}/{total}")
+    m4.metric("Processing speed", f"{proc_fps:.1f} FPS")
+else:
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Tracked rate", f"{rate:.1%}")
+    m2.metric("Frames tracked", f"{measured}/{total}")
+    m3.metric("Processing speed", f"{proc_fps:.1f} FPS")
 
 with open(out_path, "rb") as f:
     data = f.read()

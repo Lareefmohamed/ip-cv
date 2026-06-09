@@ -21,7 +21,8 @@ import cv2
 
 from src.config import PRESETS, PipelineConfig, make_preset
 from src.pipeline import (CricketBallPipeline, iter_video, process_video,
-                          process_video_assisted, video_meta)
+                          process_video_assisted, process_video_hybrid,
+                          video_meta)
 
 
 def build_config(args) -> PipelineConfig:
@@ -65,9 +66,24 @@ def main(argv=None) -> int:
                         "the ball on the start frame")
     p.add_argument("--select-frame", type=int, default=0,
                    help="frame index to seed the assisted tracker on")
+    p.add_argument("--hybrid", action="store_true",
+                   help="use the HYBRID engine (detector + CSRT + Kalman with "
+                        "gap-filling). Most robust on general real clips.")
+    p.add_argument("--no-fill-gaps", action="store_true",
+                   help="with --hybrid: do NOT fill short misses with the "
+                        "Kalman prediction (show only real detections)")
+    p.add_argument("--calibrate", action="store_true",
+                   help="with --hybrid --select: auto-tune the HSV colour range "
+                        "from the box you draw around the ball")
+    p.add_argument("--diagnose", action="store_true",
+                   help="with --hybrid: print a breakdown of per-frame outcomes "
+                        "and why blobs were rejected")
     args = p.parse_args(argv)
 
     cfg = build_config(args)
+
+    if args.hybrid:
+        return _run_hybrid(args, cfg)
 
     if args.assisted:
         return _run_assisted(args, cfg)
@@ -106,6 +122,71 @@ def main(argv=None) -> int:
     rate = (measured / total) if total else 0.0
     print(f"Detection rate: {rate:.1%} ({measured}/{total} frames)")
     return 0
+
+
+def _run_hybrid(args, cfg) -> int:
+    """Hybrid engine (detector + CSRT + Kalman + gap-fill)."""
+    if not args.output:
+        print("Hybrid mode needs --output.", file=sys.stderr)
+        return 2
+    # Default to the tuned 'hybrid' preset unless the user picked another.
+    if args.preset == "default":
+        cfg = make_preset("hybrid")
+        if args.color is not None:
+            cfg.detector.color = args.color
+        if args.no_motion:
+            cfg.detector.use_motion = False
+        if args.min_circularity is not None:
+            cfg.detector.min_circularity = args.min_circularity
+        cfg.poly_degree = args.poly_degree
+
+    bbox = None
+    if args.select:
+        from src.assisted_tracker import select_bbox_interactive
+        cap = cv2.VideoCapture(args.input)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, args.select_frame)
+        ok, frame = cap.read()
+        cap.release()
+        if not ok:
+            print("Could not read the selected frame.", file=sys.stderr)
+            return 1
+        bbox = select_bbox_interactive(frame)
+        if bbox is None:
+            print("No box selected - aborting.", file=sys.stderr)
+            return 1
+
+    calib = bbox if (args.calibrate and bbox is not None) else None
+    print(f"Hybrid tracking {args.input} -> {args.output} "
+          f"(fill_gaps={not args.no_fill_gaps}, "
+          f"calibrate={'yes' if calib else 'no'}) ...")
+    stats = process_video_hybrid(
+        args.input, out_path=args.output, config=cfg,
+        fill_gaps=not args.no_fill_gaps,
+        calibrate_bbox=calib, calibrate_frame=args.select_frame,
+        progress=lambda i, n: print(f"\r  frame {i}/{n or '?'}",
+                                    end="", flush=True))
+    print()
+    _report_hybrid(stats, diagnose=args.diagnose)
+    return 0
+
+
+def _report_hybrid(stats: dict, diagnose: bool = False) -> None:
+    print("=" * 44)
+    print(f"  Frames processed : {stats['frames']}")
+    print(f"  Detection rate   : {stats['detection_rate']:.1%}  "
+          f"(detector + CSRT locks)")
+    print(f"  Coverage         : {stats['coverage']:.1%}  "
+          f"(incl. gap-filled frames)")
+    print(f"  Mean processing  : {stats['mean_proc_fps']:.1f} FPS")
+    print(f"  Output           : {stats['out_path']}")
+    if diagnose:
+        print("  --- per-frame outcomes ---")
+        for k, v in stats["outcomes"].items():
+            print(f"    {k:10s}: {v}")
+        print("  --- detector blob reject totals ---")
+        for k, v in sorted(stats["reject_totals"].items()):
+            print(f"    {k:14s}: {v}")
+    print("=" * 44)
 
 
 def _run_assisted(args, cfg) -> int:

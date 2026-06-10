@@ -56,6 +56,10 @@ class HybridTracker:
         self.last_radius: float = 8.0
         self.trail: Deque[Tuple[int, int]] = deque(
             maxlen=self.cfg.tracker.trail_length)
+        # Frame index of each trail point (parallel deque) so the parametric
+        # trajectory fit stays correct across skipped frames.
+        self.trail_t: Deque[int] = deque(maxlen=self.cfg.tracker.trail_length)
+        self._frame_idx = -1
         # Diagnostics: counts of each per-frame outcome + detector reject sums.
         self.outcomes: dict[str, int] = {k: 0 for k in OUTCOMES}
         self.reject_totals: dict[str, int] = {}
@@ -68,12 +72,14 @@ class HybridTracker:
         self._hits = 0
         self.confirmed = False
         self.trail.clear()
+        self.trail_t.clear()
 
     # -- per frame ----------------------------------------------------------
 
     def update(self, frame: np.ndarray
                ) -> Optional[Tuple[float, float, str]]:
         cfg_t = self.cfg.tracker
+        self._frame_idx += 1
 
         # --- 1. Kalman prediction (None until a track exists) -------------
         pred: Optional[Tuple[float, float]] = None
@@ -111,6 +117,7 @@ class HybridTracker:
             self._hits = 0
             if self._coast <= cfg_t.max_coast_frames and self.fill_gaps:
                 self.trail.append((int(pred[0]), int(pred[1])))
+                self.trail_t.append(self._frame_idx)
                 self.outcomes["filled"] += 1
                 return (pred[0], pred[1], "filled")
             if self._coast > cfg_t.max_coast_frames:
@@ -174,6 +181,7 @@ class HybridTracker:
         if self._hits >= self.cfg.tracker.min_hits_to_confirm:
             self.confirmed = True
         self.trail.append((int(cx), int(cy)))
+        self.trail_t.append(self._frame_idx)
 
     def _seed_csrt(self, frame, d: Detection) -> None:
         bbox = detection_to_bbox(d)

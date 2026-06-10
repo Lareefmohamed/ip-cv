@@ -40,6 +40,7 @@ class Detection:
     fill_ratio: float    # contour area / enclosing-circle area in [0, 1]
     motion_overlap: float = 0.0   # fraction of blob pixels flagged as motion
     is_blur: bool = False         # accepted as an elongated motion-blur streak
+    conf: float = 1.0             # detector confidence (YOLO); 1.0 for classical
 
     @property
     def center(self) -> tuple[float, float]:
@@ -62,6 +63,14 @@ class BallDetector:
         self._frame_count = 0
         # Per-frame tally of why contours were rejected (for --diagnose).
         self.last_stats: dict[str, int] = {}
+        # Most recent warm MOG2 motion mask (None until warmed up / disabled).
+        # Other components (e.g. the YOLO tracker) use it to check whether a
+        # detection is actually moving before trusting it to start a track.
+        self.last_motion_mask: Optional[np.ndarray] = None
+        # Most recent raw HSV colour mask (pre-morphology).  Used by the YOLO
+        # tracker to check a candidate is actually ball-coloured before
+        # seeding (a moving white shoe is "sports ball"-shaped but not red).
+        self.last_color_mask: Optional[np.ndarray] = None
         if self.cfg.use_motion:
             self._init_bg()
 
@@ -94,6 +103,7 @@ class BallDetector:
 
         # 2 + 3. HSV colour mask.
         color_mask = self._color_mask(blurred)
+        self.last_color_mask = color_mask
 
         # 4 + 5. Motion gate.  MOG2 needs a few frames to learn the background,
         # so during warm-up we fall back to colour-only.
@@ -106,6 +116,7 @@ class BallDetector:
             if cfg.motion_dilate > 0:
                 mk = np.ones((cfg.motion_dilate, cfg.motion_dilate), np.uint8)
                 motion = cv2.dilate(motion, mk, iterations=1)
+        self.last_motion_mask = motion if warm else None
 
         if cfg.use_motion and motion is not None and not cfg.soft_motion:
             # Hard gate (default): blob must be the right colour AND moving.

@@ -22,7 +22,7 @@ import cv2
 from src.config import PRESETS, PipelineConfig, make_preset
 from src.pipeline import (CricketBallPipeline, iter_video, process_video,
                           process_video_assisted, process_video_hybrid,
-                          video_meta)
+                          process_video_yolo, video_meta)
 
 
 def build_config(args) -> PipelineConfig:
@@ -69,6 +69,20 @@ def main(argv=None) -> int:
     p.add_argument("--hybrid", action="store_true",
                    help="use the HYBRID engine (detector + CSRT + Kalman with "
                         "gap-filling). Most robust on general real clips.")
+    p.add_argument("--yolo", action="store_true",
+                   help="use the YOLO engine (YOLOv8 'sports ball' class + "
+                        "CSRT + Kalman). Detects ONLY the ball - never "
+                        "helmets/gloves - and handles motion blur at normal "
+                        "speed. Needs: pip install ultralytics")
+    p.add_argument("--yolo-conf", type=float, default=None,
+                   help="YOLO confidence threshold (default 0.08; lower = "
+                        "more recall on small/blurred balls)")
+    p.add_argument("--yolo-imgsz", type=int, default=None,
+                   help="YOLO inference size (default 1280; 640 is ~3x "
+                        "faster but misses small distant balls)")
+    p.add_argument("--yolo-weights", default=None,
+                   help="path to YOLO weights (default yolov8n.pt, "
+                        "auto-downloaded on first run)")
     p.add_argument("--no-fill-gaps", action="store_true",
                    help="with --hybrid: do NOT fill short misses with the "
                         "Kalman prediction (show only real detections)")
@@ -81,6 +95,9 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     cfg = build_config(args)
+
+    if args.yolo:
+        return _run_yolo(args, cfg)
 
     if args.hybrid:
         return _run_hybrid(args, cfg)
@@ -121,6 +138,45 @@ def main(argv=None) -> int:
     cv2.destroyAllWindows()
     rate = (measured / total) if total else 0.0
     print(f"Detection rate: {rate:.1%} ({measured}/{total} frames)")
+    return 0
+
+
+def _run_yolo(args, cfg) -> int:
+    """YOLO engine (YOLOv8 ball-class detector + CSRT + Kalman + gap-fill)."""
+    if not args.output:
+        print("YOLO mode needs --output.", file=sys.stderr)
+        return 2
+    # Default to the tuned 'yolo' preset unless the user picked another.
+    if args.preset == "default":
+        cfg = make_preset("yolo")
+        if args.color is not None:
+            cfg.detector.color = args.color
+        if args.no_motion:
+            cfg.detector.use_motion = False
+        if args.min_circularity is not None:
+            cfg.detector.min_circularity = args.min_circularity
+        cfg.poly_degree = args.poly_degree
+    if args.yolo_conf is not None:
+        cfg.yolo.conf = args.yolo_conf
+    if args.yolo_imgsz is not None:
+        cfg.yolo.imgsz = args.yolo_imgsz
+    if args.yolo_weights is not None:
+        cfg.yolo.weights = args.yolo_weights
+
+    print(f"YOLO tracking {args.input} -> {args.output} "
+          f"(conf={cfg.yolo.conf}, imgsz={cfg.yolo.imgsz}, "
+          f"fill_gaps={not args.no_fill_gaps}) ...")
+    try:
+        stats = process_video_yolo(
+            args.input, out_path=args.output, config=cfg,
+            fill_gaps=not args.no_fill_gaps,
+            progress=lambda i, n: print(f"\r  frame {i}/{n or '?'}",
+                                        end="", flush=True))
+    except RuntimeError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return 1
+    print()
+    _report_hybrid(stats, diagnose=args.diagnose)
     return 0
 
 

@@ -290,7 +290,8 @@ def process_video_hybrid(in_path: str,
                     measured += 1
                 track_log.append((idx, ball[0], ball[1], ball[2]))
             annotated = draw_overlay(frame, cfg, ball, tracker.last_radius,
-                                     tracker.trail, fps=fps, frame_idx=idx)
+                                     tracker.trail, fps=fps, frame_idx=idx,
+                                     trail_t=tracker.trail_t)
             if writer is not None:
                 writer.write(annotated)
             if progress is not None:
@@ -311,6 +312,73 @@ def process_video_hybrid(in_path: str,
         "outcomes": tracker.outcomes,
         "reject_totals": tracker.reject_totals,
         "mode": "hybrid",
+    }
+
+
+def process_video_yolo(in_path: str,
+                       out_path: Optional[str] = None,
+                       config: Optional[PipelineConfig] = None,
+                       fill_gaps: bool = True,
+                       progress: Optional[Callable[[int, int], None]] = None
+                       ) -> dict:
+    """Process a whole video with the YOLO engine (YOLOv8 + CSRT + Kalman).
+
+    YOLO only ever reports COCO class 32 ("sports ball"), so helmets / gloves
+    can never be tracked.  Stats shape matches ``process_video_hybrid``;
+    ``detection_rate`` counts genuine locks (yolo / classical / CSRT).
+    """
+    # Local import keeps ultralytics/torch optional for the other engines.
+    from .yolo_tracker import YoloHybridTracker
+
+    meta = video_meta(in_path)
+    cfg = config or PipelineConfig()
+    tracker = YoloHybridTracker(cfg, fill_gaps=fill_gaps)
+
+    writer = None
+    if out_path:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(out_path, fourcc, meta["fps"] or 30.0,
+                                 (meta["width"], meta["height"]))
+
+    measured = covered = total = 0
+    fps_sum = 0.0
+    track_log: List[Tuple[int, float, float, str]] = []
+    try:
+        for idx, frame in enumerate(iter_video(in_path)):
+            t0 = time.perf_counter()
+            ball = tracker.update(frame)
+            dt = time.perf_counter() - t0
+            fps = 1.0 / dt if dt > 0 else 0.0
+            fps_sum += fps
+            total += 1
+            if ball is not None:
+                covered += 1
+                if ball[2] in ("yolo", "measured", "csrt"):
+                    measured += 1
+                track_log.append((idx, ball[0], ball[1], ball[2]))
+            annotated = draw_overlay(frame, cfg, ball, tracker.last_radius,
+                                     tracker.trail, fps=fps, frame_idx=idx,
+                                     trail_t=tracker.trail_t)
+            if writer is not None:
+                writer.write(annotated)
+            if progress is not None:
+                progress(total, meta["frames"])
+    finally:
+        if writer is not None:
+            writer.release()
+
+    return {
+        "frames": total,
+        "measured_detections": measured,
+        "detection_rate": (measured / total) if total else 0.0,
+        "coverage": (covered / total) if total else 0.0,
+        "mean_proc_fps": (fps_sum / total) if total else 0.0,
+        "video_fps": meta["fps"],
+        "out_path": out_path,
+        "track_log": track_log,
+        "outcomes": tracker.outcomes,
+        "reject_totals": tracker.reject_totals,
+        "mode": "yolo",
     }
 
 

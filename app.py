@@ -3,13 +3,14 @@
 Run with:
     streamlit run app.py
 
-Two tracking engines, both traditional CV (no deep learning):
+Tracking engines:
+  * YOLO        - YOLOv8 deep detector (COCO "sports ball" class only) fused
+                  with CSRT + Kalman. Detects ONLY the ball - never helmets or
+                  gloves - and handles motion blur at normal speed.
+  * Hybrid      - traditional CV: HSV detector + CSRT + Kalman with gap-fill.
   * Automatic   - HSV colour masking + MOG2 motion gating + Kalman tracking.
-                  Best for steady cameras with a clearly visible (ideally red)
-                  ball.
-  * Assisted    - CSRT correlation-filter tracker. Far more robust on hard
-                  footage (white balls, clutter, motion blur). Either auto-seeds
-                  from the detector, or you place a box on the ball yourself.
+  * Assisted    - CSRT correlation-filter tracker. Either auto-seeds from the
+                  detector, or you place a box on the ball yourself.
 """
 
 from __future__ import annotations
@@ -23,14 +24,15 @@ import streamlit as st
 
 from src.config import PipelineConfig, make_preset
 from src.pipeline import (CricketBallPipeline, process_video_assisted,
-                          process_video_hybrid, video_meta)
+                          process_video_hybrid, process_video_yolo,
+                          video_meta)
 
 st.set_page_config(page_title="Cricket Ball Trajectory Tracker",
                    page_icon="🏏", layout="wide")
 
 st.title("🏏 Cricket Ball Trajectory Tracker")
-st.caption("Traditional computer vision — HSV masking + MOG2 + Kalman, or the "
-           "CSRT assisted tracker. No deep learning. (Group 39, EC7205)")
+st.caption("YOLOv8 ball detection fused with CSRT + Kalman tracking, plus "
+           "classical HSV/MOG2 engines. (Group 39, EC7205)")
 
 
 # --- Sidebar controls ------------------------------------------------------
@@ -38,19 +40,39 @@ with st.sidebar:
     st.header("Settings")
     mode = st.radio(
         "Tracking mode",
-        ["Hybrid (recommended)",
+        ["YOLO + tracking (recommended)",
+         "Hybrid (classical CV)",
          "Automatic (HSV + motion)",
          "Assisted (CSRT, auto-seed)",
          "Assisted (CSRT, click the ball)"],
         index=0,
-        help="Hybrid = detector + CSRT + Kalman with gap-filling; most robust "
-             "on general clips. Automatic = colour-only. Assisted = CSRT only.")
+        help="YOLO = deep 'sports ball' detector + CSRT + Kalman; detects only "
+             "the ball, works on all camera views and normal-speed footage. "
+             "Hybrid = classical detector + CSRT + Kalman. "
+             "Automatic = colour-only. Assisted = CSRT only.")
+    is_yolo = mode.startswith("YOLO")
     is_hybrid = mode.startswith("Hybrid")
     is_assisted = mode.startswith("Assisted")
     is_manual = mode.endswith("click the ball)")
 
     fill_gaps = True
     calibrate = False
+    yolo_conf = 0.08
+    yolo_imgsz = 1280
+    if is_yolo:
+        st.caption("Downloads yolov8n.pt (~7 MB) on first use. "
+                   "Needs: pip install ultralytics")
+        yolo_conf = st.slider(
+            "YOLO confidence", 0.01, 0.50, 0.08, 0.01,
+            help="Lower = more recall on small/blurred balls; the Kalman gate "
+                 "filters out the noise.")
+        yolo_imgsz = st.selectbox(
+            "YOLO inference size", [640, 960, 1280], index=2,
+            help="Smaller = faster; larger = better for small/distant balls.")
+        fill_gaps = st.checkbox(
+            "Fill short gaps smoothly", value=True,
+            help="Interpolate brief misses from the Kalman prediction so the "
+                 "trajectory stays continuous (counts toward coverage).")
     if is_hybrid:
         fill_gaps = st.checkbox(
             "Fill short gaps smoothly", value=True,
@@ -80,10 +102,18 @@ with st.sidebar:
 
 
 def make_config() -> PipelineConfig:
-    cfg = make_preset("hybrid") if is_hybrid else PipelineConfig()
+    if is_yolo:
+        cfg = make_preset("yolo")
+        cfg.yolo.conf = yolo_conf
+        cfg.yolo.imgsz = yolo_imgsz
+    elif is_hybrid:
+        cfg = make_preset("hybrid")
+    else:
+        cfg = PipelineConfig()
     cfg.detector.color = color
     cfg.detector.use_motion = use_motion
-    cfg.detector.min_circularity = min_circ
+    if not is_yolo:   # YOLO preset keeps its tuned shape relaxations
+        cfg.detector.min_circularity = min_circ
     cfg.detector.blur_ksize = blur
     cfg.poly_degree = poly_deg
     return cfg
@@ -157,7 +187,34 @@ out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
 
 # --- Processing ------------------------------------------------------------
 coverage = None
-if is_hybrid:
+if is_yolo:
+    progress = st.progress(0.0, text="Tracking (YOLO)…")
+    n_frames = max(meta["frames"], 1)
+
+    def _cb(i, n):
+        progress.progress(min(i / n_frames, 1.0),
+                          text=f"Tracking… {i}/{meta['frames']}")
+
+    try:
+        stats = process_video_yolo(
+            tmp_in.name, out_path=out_path, config=cfg,
+            fill_gaps=fill_gaps, progress=_cb)
+    except RuntimeError as exc:
+        progress.empty()
+        st.error(str(exc))
+        st.stop()
+    progress.empty()
+    measured = stats["measured_detections"]
+    total = stats["frames"]
+    rate = stats["detection_rate"]
+    coverage = stats["coverage"]
+    proc_fps = stats["mean_proc_fps"]
+    track_log = stats["track_log"]
+    oc = stats["outcomes"]
+    st.caption(f"Per-frame outcomes — YOLO: {oc['yolo']}, "
+               f"classical: {oc['measured']}, CSRT: {oc['csrt']}, "
+               f"gap-filled: {oc['filled']}, lost: {oc['lost']}")
+elif is_hybrid:
     progress = st.progress(0.0, text="Tracking (hybrid)…")
     n_frames = max(meta["frames"], 1)
 

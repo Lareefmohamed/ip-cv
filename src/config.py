@@ -113,11 +113,39 @@ class TrackerConfig:
 
 
 @dataclass
+class YoloConfig:
+    """Parameters for the YOLOv8 deep-learning ball detector.
+
+    Restricting to COCO class 32 ("sports ball") is what guarantees helmets,
+    gloves and pads are never reported as the ball.  The confidence threshold
+    is deliberately low because a small / motion-blurred cricket ball scores
+    weakly; the Kalman gate decides whether a weak detection is trustworthy.
+    """
+
+    weights: str = "yolov8n.pt"   # auto-downloads (~6.5 MB) on first use
+    conf: float = 0.05            # low threshold for small / blurred balls
+    imgsz: int = 1280             # inference size; bigger = better small-object
+    #                               recall, smaller (640) = faster
+    classes: Tuple[int, ...] = (32,)   # COCO "sports ball" ONLY
+    max_det: int = 8
+    # Min confidence to START a new track.  Deliberately modest: a tiny
+    # cricket ball rarely scores high on COCO models, and seeding is further
+    # vetted by motion AND ball-colour checks in the tracker.
+    seed_conf: float = 0.15
+    device: str = ""              # "" = auto (GPU if available, else CPU)
+    # Safety net: if YOLO has not seeded a track after this many frames, allow
+    # the classical detector to seed one (moving-blob rules apply).  A strong
+    # YOLO detection later re-seeds the track if classical picked wrongly.
+    classical_seed_after: int = 8
+
+
+@dataclass
 class PipelineConfig:
     """Top-level config bundling detector + tracker + drawing options."""
 
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
+    yolo: YoloConfig = field(default_factory=YoloConfig)
 
     # Trajectory drawing.
     draw_raw_points: bool = True
@@ -182,7 +210,22 @@ def make_preset(name: str) -> PipelineConfig:
         cfg.tracker.max_match_dist = 140.0
         cfg.tracker.max_coast_frames = 12
         return cfg
+    if name == "yolo":
+        # YOLO engine: the deep detector finds the ball; the classical
+        # detector is only a fallback inside the prediction ROI, so it gets
+        # the same relaxations as the hybrid preset.  Wider gate + longer
+        # coast bridge motion-blur streaks on normal-speed footage.
+        cfg.detector.soft_motion = True
+        cfg.detector.accept_blur = True
+        cfg.detector.min_circularity = 0.40
+        cfg.detector.min_fill_ratio = 0.45
+        cfg.detector.min_area = 6.0
+        cfg.detector.motion_dilate = 13
+        cfg.detector.warmup_frames = 6
+        cfg.tracker.max_match_dist = 160.0
+        cfg.tracker.max_coast_frames = 15
+        return cfg
     raise ValueError(f"Unknown preset: {name!r}")
 
 
-PRESETS = ["default", "fast", "white-ball", "broadcast", "hybrid"]
+PRESETS = ["default", "fast", "white-ball", "broadcast", "hybrid", "yolo"]

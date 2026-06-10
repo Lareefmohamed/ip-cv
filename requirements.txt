@@ -3,3 +3,7 @@ opencv-contrib-python>=4.8
 numpy>=1.24
 scipy>=1.10
 streamlit>=1.30
+# YOLO engine (deep ball detector). Pulls in CPU torch on Windows (large
+# download). yolov8n.pt (~7 MB) auto-downloads on first run; for offline use
+# pre-download it and pass --yolo-weights path\to\yolov8n.pt
+ultralytics>=8.2
